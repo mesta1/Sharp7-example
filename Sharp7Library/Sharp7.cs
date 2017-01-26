@@ -1,5 +1,5 @@
 ﻿/*=============================================================================|
-|  PROJECT Sharp7                                                        1.0.0 |
+|  PROJECT Sharp7                                                        1.0.3 |
 |==============================================================================|
 |  Copyright (C) 2016 Davide Nardella                                          |
 |  All rights reserved.                                                        |
@@ -22,11 +22,22 @@
 |  You should have received a copy of the GNU General Public License and a     |
 |  copy of Lesser GNU General Public License along with Sharp7.                |
 |  If not, see  http://www.gnu.org/licenses/                                   |
-|=============================================================================*/
+|==============================================================================|
+History:
+ * 1.0.0 2016/10/09 First Release
+ * 1.0.1 2016/10/22 Added CoreCLR compatibility (CORE_CLR symbol must be 
+                    defined in Build options).
+                    Thanks to Dirk-Jan Wassink.
+ * 1.0.2 2016/11/13 Fixed a bug in CLR compatibility
+ * 1.0.3 2017/01/25 Fixed a bug in S7.GetIntAt(). Thanks to lupal1
+                    Added S7Timer Read/Write. Thanks to Lukas Palkovic 
+
+*/
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Collections.Generic;
 //------------------------------------------------------------------------------
 // If you are compiling for UWP verify that WINDOWS_UWP or NETFX_CORE are 
 // defined into Project Properties->Build->Conditional compilation symbols
@@ -347,8 +358,15 @@ namespace Sharp7
             Socket PingSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             try
             {
+
+#if CORE_CLR
+                var task = PingSocket.ConnectAsync(Host, Port);
+                task.Wait(_ConnectTimeout);
+                bool success = task.IsCompleted;
+#else
                 IAsyncResult result = PingSocket.BeginConnect(Host, Port, null, null);
                 bool success = result.AsyncWaitHandle.WaitOne(_ConnectTimeout, true);
+#endif
                 if (!success)
                 {
                     LastError = S7Consts.errTCPConnectionFailed;
@@ -358,7 +376,11 @@ namespace Sharp7
             {
                 LastError = S7Consts.errTCPConnectionFailed;
             };
+#if CORE_CLR
+            PingSocket.Dispose();
+#else
             PingSocket.Close();
+#endif
         }
 
         public int Connect(string Host, int Port)
@@ -613,6 +635,88 @@ namespace Sharp7
         #endregion
     }
 
+    public class S7Timer
+    {
+        #region S7Timer
+        TimeSpan pt;
+        TimeSpan et;
+        bool input = false;
+        bool q = false;
+        public S7Timer(byte[] buff, int position)
+        {
+            if (position + 12 < buff.Length)
+            {
+                return;
+            }
+            else
+            {
+                SetTimer(new List<byte>(buff).GetRange(position, 16).ToArray());
+            }
+        }
+
+        public S7Timer(byte[] buff)
+        {
+            SetTimer(buff);
+        }
+
+        private void SetTimer(byte[] buff)
+        {
+            if (buff.Length != 12)
+            {
+                this.pt = new TimeSpan(0);
+                this.et = new TimeSpan(0);
+            }
+            else
+            {
+                Int32 resPT;
+                resPT = buff[0]; resPT <<= 8;
+                resPT += buff[1]; resPT <<= 8;
+                resPT += buff[2]; resPT <<= 8;
+                resPT += buff[3];
+                this.pt = new TimeSpan(0, 0, 0, 0, resPT);
+
+                Int32 resET;
+                resET = buff[4]; resET <<= 8;
+                resET += buff[5]; resET <<= 8;
+                resET += buff[6]; resET <<= 8;
+                resET += buff[7];
+                this.et = new TimeSpan(0, 0, 0, 0, resET);
+
+                this.input = (buff[8] & 0x01) == 0x01;
+                this.q = (buff[8] & 0x02) == 0x02;
+            }
+        }
+        public TimeSpan PT
+        {
+            get
+            {
+                return pt;
+            }
+        }
+        public TimeSpan ET
+        {
+            get
+            {
+                return et;
+            }
+        }
+        public bool IN
+        {
+            get
+            {
+                return input;
+            }
+        }
+        public bool Q
+        {
+            get
+            {
+                return q;
+            }
+        }
+        #endregion
+    }
+
     public static class S7
     {
         #region [Help Functions]
@@ -695,7 +799,7 @@ namespace Sharp7
         #region Get/Set 16 bit signed value (S7 int) -32768..32767
         public static int GetIntAt(byte[] Buffer, int Pos)
         {
-            return (int)((Buffer[Pos] << 8) | Buffer[Pos + 1]);
+            return (short)((Buffer[Pos] << 8) | Buffer[Pos + 1]);
         }
         public static void SetIntAt(byte[] Buffer, int Pos, Int16 Value)
         {
@@ -1130,6 +1234,37 @@ namespace Sharp7
         {
             Buffer[Pos] = ToCounter(Value);
         }
+        #endregion
+
+        #region Get/Set Timer
+        
+        public static S7Timer GetS7TimerAt(byte[] Buffer, int Pos)
+        {
+            return new S7Timer(new List<byte>(Buffer).GetRange(Pos, 12).ToArray());
+        }
+
+        public static void SetS7TimespanAt(byte[] Buffer, int Pos, TimeSpan Value)
+        {
+            SetDIntAt(Buffer, Pos, (Int32)Value.TotalMilliseconds);
+        }
+
+        public static TimeSpan GetS7TimespanAt(byte[] Buffer, int pos)
+        {
+            if (Buffer.Length < pos + 4)
+            {
+                return new TimeSpan();
+            }
+
+            Int32 a;
+            a = Buffer[pos + 0]; a <<= 8;
+            a += Buffer[pos + 1]; a <<= 8;
+            a += Buffer[pos + 2]; a <<= 8;
+            a += Buffer[pos + 3];
+            TimeSpan sp = new TimeSpan(0, 0, 0, 0, a);
+
+            return sp;
+        }        
+        
         #endregion
 
         #endregion [Help Functions]
@@ -2687,7 +2822,7 @@ namespace Sharp7
         private string SiemensTimestamp(long EncodedDate)
         {
             DateTime DT = new DateTime(1984, 1, 1).AddSeconds(EncodedDate*86400);
-#if WINDOWS_UWP || NETFX_CORE
+#if WINDOWS_UWP || NETFX_CORE || CORE_CLR
             return DT.ToString(System.Globalization.DateTimeFormatInfo.CurrentInfo.ShortDatePattern);
 #else
             return DT.ToShortDateString();
